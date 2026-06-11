@@ -3,6 +3,10 @@
 # Author: Aryan Bhagat | FAU Computer Science
 # Dataset: HAM10000 / ISIC 2025 version
 # ============================================================
+# FIX: Split FIRST, then oversample ONLY the training set.
+# This prevents duplicate images from leaking between
+# train and test sets, ensuring valid evaluation metrics.
+# ============================================================
 
 import os
 import zipfile
@@ -18,7 +22,8 @@ from tensorflow.keras.callbacks import (
     ReduceLROnPlateau, EarlyStopping, ModelCheckpoint
 )
 from sklearn.metrics import (
-    confusion_matrix, roc_auc_score, accuracy_score
+    confusion_matrix, roc_auc_score, accuracy_score,
+    precision_score, f1_score
 )
 from sklearn.model_selection import train_test_split
 from sklearn.utils import resample
@@ -30,8 +35,8 @@ import seaborn as sns
 # ============================================================
 # CONFIG — Update these paths if needed
 # ============================================================
-IMAGES_ZIP  = "ISIC-images.zip"          # your zip file
-IMAGES_DIR  = "ISIC-images"              # extracted folder name
+IMAGES_ZIP  = "ISIC-images.zip"
+IMAGES_DIR  = "ISIC-images"
 LABELS_CSV  = "ham10000_metadata_2025-08-18.csv"
 MODEL_SAVE  = "best_melanoma_model.keras"
 BATCH_SIZE  = 32
@@ -54,24 +59,21 @@ else:
     print(f"Images folder '{IMAGES_DIR}' already exists — skipping extraction.")
 
 # ============================================================
-# STEP 2 — Load metadata & check columns
+# STEP 2 — Load metadata & build filepaths
 # ============================================================
 print("\nLoading metadata...")
 df = pd.read_csv(LABELS_CSV)
 print(f"Columns found: {list(df.columns)}")
 print(f"Total rows: {len(df)}")
 
-# The diagnosis column is 'diagnosis_1' with values 'Malignant' / 'Benign'
-# Create binary label: 1 = Malignant (Melanoma), 0 = Benign
+# Binary label: 1 = Malignant, 0 = Benign
 df['label'] = df['diagnosis_1'].apply(
     lambda x: 1 if str(x).strip().lower() == 'malignant' else 0
 )
 
-print(f"\nClass distribution:")
+print(f"\nClass distribution (full dataset):")
 print(df['label'].value_counts())
-print(f"Malignant: {df['label'].sum()} | Benign: {(df['label']==0).sum()}")
 
-# Build filepath — images are named like ISIC_0024306.jpg
 def find_image(isic_id):
     for ext in ['.jpg', '.jpeg', '.png', '.JPG']:
         path = os.path.join(IMAGES_DIR, isic_id + ext)
@@ -81,44 +83,62 @@ def find_image(isic_id):
 
 df['filepath'] = df['isic_id'].apply(find_image)
 df = df[df['filepath'].notna()].reset_index(drop=True)
-print(f"\nImages found: {len(df)} out of {len(pd.read_csv(LABELS_CSV))}")
+print(f"\nImages matched to metadata: {len(df)}")
+print(f"Malignant: {df['label'].sum()} | Benign: {(df['label']==0).sum()}")
 
 # ============================================================
-# STEP 3 — Balance classes with oversampling
+# STEP 3 — SPLIT FIRST (before any oversampling)
 # ============================================================
-df_benign   = df[df['label'] == 0]
-df_melanoma = df[df['label'] == 1]
-
-print(f"\nBefore balancing — Benign: {len(df_benign)} | Malignant: {len(df_melanoma)}")
-
-# Oversample minority class to match majority
-if len(df_melanoma) < len(df_benign):
-    df_melanoma_up = resample(df_melanoma, replace=True,
-                              n_samples=len(df_benign), random_state=SEED)
-    df_balanced = pd.concat([df_benign, df_melanoma_up])
-else:
-    df_benign_up = resample(df_benign, replace=True,
-                            n_samples=len(df_melanoma), random_state=SEED)
-    df_balanced = pd.concat([df_melanoma, df_benign_up])
-
-df_balanced = df_balanced.sample(frac=1, random_state=SEED).reset_index(drop=True)
-print(f"After balancing — Total: {len(df_balanced)} | "
-      f"Malignant: {df_balanced['label'].sum()} | "
-      f"Benign: {(df_balanced['label']==0).sum()}")
-
+# This is the critical fix. We split on the ORIGINAL unbalanced
+# dataset so no duplicate rows can appear in both train and test.
 # ============================================================
-# STEP 4 — Train / Val / Test Split (64 / 16 / 20)
-# ============================================================
-X = df_balanced['filepath'].values
-y = df_balanced['label'].values
+print("\n--- Splitting dataset BEFORE oversampling ---")
+
+X = df['filepath'].values
+y = df['label'].values
 
 X_trainval, X_test, y_trainval, y_test = train_test_split(
     X, y, test_size=0.20, stratify=y, random_state=SEED)
+
 X_train, X_val, y_train, y_val = train_test_split(
     X_trainval, y_trainval, test_size=0.20,
     stratify=y_trainval, random_state=SEED)
 
-print(f"\nSplit — Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+print(f"Train (before oversampling): {len(X_train)} "
+      f"| Val: {len(X_val)} | Test: {len(X_test)}")
+print(f"Test set — Malignant: {y_test.sum()} | Benign: {(y_test==0).sum()}")
+
+# ============================================================
+# STEP 4 — Oversample ONLY the TRAINING SET
+# ============================================================
+# Val and test sets are left untouched — real, unduped images only.
+# ============================================================
+print("\n--- Oversampling training set only ---")
+
+train_df = pd.DataFrame({'filepath': X_train, 'label': y_train})
+df_benign_tr   = train_df[train_df['label'] == 0]
+df_melanoma_tr = train_df[train_df['label'] == 1]
+
+print(f"Before: Benign={len(df_benign_tr)} | Malignant={len(df_melanoma_tr)}")
+
+if len(df_melanoma_tr) < len(df_benign_tr):
+    df_melanoma_up = resample(df_melanoma_tr, replace=True,
+                              n_samples=len(df_benign_tr), random_state=SEED)
+    train_balanced = pd.concat([df_benign_tr, df_melanoma_up])
+else:
+    df_benign_up = resample(df_benign_tr, replace=True,
+                            n_samples=len(df_melanoma_tr), random_state=SEED)
+    train_balanced = pd.concat([df_melanoma_tr, df_benign_up])
+
+train_balanced = train_balanced.sample(
+    frac=1, random_state=SEED).reset_index(drop=True)
+
+X_train = train_balanced['filepath'].values
+y_train = train_balanced['label'].values
+
+print(f"After:  Total={len(X_train)} "
+      f"| Malignant={y_train.sum()} | Benign={(y_train==0).sum()}")
+print(f"\nFinal split — Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
 # ============================================================
 # STEP 5 — tf.data Pipeline
@@ -205,29 +225,38 @@ history_s2 = model.fit(
 # ============================================================
 # STEP 9 — Final Evaluation on Test Set
 # ============================================================
-print("\n--- Phase 3: Final Evaluation for Publication ---")
+print("\n--- Final Evaluation on Held-Out Test Set ---")
 
 y_prob = model.predict(test_ds, verbose=1).ravel()
 y_pred = (y_prob >= 0.5).astype(int)
 
-cm       = confusion_matrix(y_test, y_pred)
+cm           = confusion_matrix(y_test, y_pred)
 tn, fp, fn, tp = cm.ravel()
-acc      = accuracy_score(y_test, y_pred)
-sens     = tp / (tp + fn)
-spec     = tn / (tn + fp)
-auc      = roc_auc_score(y_test, y_prob)
+acc          = accuracy_score(y_test, y_pred)
+sens         = tp / (tp + fn)
+spec         = tn / (tn + fp)
+prec         = precision_score(y_test, y_pred)
+f1           = f1_score(y_test, y_pred)
+auc          = roc_auc_score(y_test, y_prob)
 
-print("=" * 46)
-print("Publishable Performance Metrics")
-print("=" * 46)
-print(f"Confusion Matrix:\n{cm}")
-print(f"Total Test Samples: {len(y_test)}")
-print("-" * 46)
-print(f"Primary Metric (Accuracy): {acc:.4f}")
-print(f"Sensitivity (Melanoma Recall): {sens:.4f} (Crucial!)")
-print(f"Specificity (Benign Recall): {spec:.4f}")
-print(f"AUC-ROC Score: {auc:.4f}")
-print("=" * 46)
+print("=" * 50)
+print("Final Performance Metrics")
+print("=" * 50)
+print(f"Test set size:         {len(y_test)}")
+print(f"  Malignant (actual):  {y_test.sum()}")
+print(f"  Benign (actual):     {(y_test==0).sum()}")
+print("-" * 50)
+print(f"AUC-ROC:               {auc:.4f}")
+print(f"Accuracy:              {acc:.4f}  ({acc*100:.2f}%)")
+print(f"Sensitivity (Recall):  {sens:.4f}  ({sens*100:.2f}%)")
+print(f"Specificity:           {spec:.4f}  ({spec*100:.2f}%)")
+print(f"Precision:             {prec:.4f}  ({prec*100:.2f}%)")
+print(f"F1-Score:              {f1:.4f}  ({f1*100:.2f}%)")
+print("-" * 50)
+print(f"TP={tp} | TN={tn} | FP={fp} | FN={fn}")
+print("=" * 50)
+print("\nNOTE: Test set contains only original images (no duplicates).")
+print("Oversampling was applied to training set only.")
 
 # ============================================================
 # STEP 10 — Save Confusion Matrix Figure
@@ -256,6 +285,6 @@ fig.text(0.5, 0.01,
          ha='center', fontsize=9, style='italic')
 plt.tight_layout(rect=[0, 0.04, 1, 1])
 plt.savefig('confusion_matrix.png', dpi=180, bbox_inches='tight')
-print("Confusion Matrix saved as 'confusion_matrix.png'")
-print(f"\nModel saved as '{MODEL_SAVE}'")
-print("Done! You can now run the detector app.")
+print("\nConfusion matrix saved as 'confusion_matrix.png'")
+print(f"Model saved as '{MODEL_SAVE}'")
+print("\nDone! Run the detector app with: streamlit run melanoma_detector_app.py")
